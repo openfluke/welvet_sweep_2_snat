@@ -19,6 +19,8 @@ type Topology struct {
 	Cameral  string `json:"cameral"`
 }
 type Configuration struct {
+	Group    string             `json:"group,omitempty"`
+	Example  string             `json:"example,omitempty"`
 	Recipe   int                `json:"recipe"`
 	DType    core.DType         `json:"dtype"`
 	Layer    string             `json:"layer"`
@@ -41,6 +43,7 @@ func (c Configuration) Description() string {
 }
 
 type Catalogue struct {
+	Showcase   []Configuration      `json:"showcase,omitempty"`
 	DTypes     []core.DType         `json:"dtypes"`
 	Layers     []string             `json:"layers"`
 	Modes      []parallel.TrainMode `json:"modes"`
@@ -104,6 +107,9 @@ func (c *Catalogue) rebuild() {
 	sort.Slice(c.sorted, func(i, j int) bool { return c.sorted[i] < c.sorted[j] })
 }
 func (c *Catalogue) At(index int64) Configuration {
+	if c.Showcase != nil {
+		return c.Showcase[index]
+	}
 	if index < 0 || index >= c.Total {
 		panic("catalogue index out of range")
 	}

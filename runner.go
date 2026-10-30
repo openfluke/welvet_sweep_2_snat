@@ -33,6 +33,10 @@ type Result struct {
 	Duration  float64       `json:"duration_seconds"`
 }
 type Dashboard struct {
+	HasStarted     bool           `json:"has_started"`
+	Profile        string         `json:"profile"`
+	SessionCount   int            `json:"session_count"`
+	Group          string         `json:"group"`
 	Telemetry      snat.UDPStats  `json:"telemetry"`
 	Progress       snat.Progress  `json:"progress"`
 	Configuration  *Configuration `json:"configuration"`
@@ -99,9 +103,10 @@ func writeAtomic(path string, value any) error {
 func (r *Runner) initialize(newRun bool) error {
 	b, _ := json.Marshal(struct {
 		Catalogue *Catalogue
+		Profile   string
 		Samples   int
 		LR        float64
-	}{r.catalogue, r.samples, r.lr})
+	}{r.catalogue, r.profile, r.samples, r.lr})
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256(b))
 	path := filepath.Join(r.data, "checkpoint.json")
 	if !newRun {
@@ -130,7 +135,7 @@ func (r *Runner) initialize(newRun bool) error {
 	if err := writeAtomic(path, r.cp); err != nil {
 		return err
 	}
-	r.state = Dashboard{RunID: r.cp.RunID, TCP: r.tcp, CatalogueTotal: r.catalogue.Total, Recent: []Result{}, Started: time.Now().UTC()}
+	r.state = Dashboard{Profile: r.profile, SessionCount: r.catalogue.SessionCount(), Progress: snat.Progress{Status: "ready", Total: r.catalogue.Total, Completed: r.cp.Next, Succeeded: r.cp.Succeeded, Unsupported: r.cp.Unsupported, Failed: r.cp.Failed}, OverallPercent: float64(r.cp.Next) / float64(r.catalogue.Total) * 100, RunID: r.cp.RunID, TCP: r.tcp, CatalogueTotal: r.catalogue.Total, Recent: []Result{}, Started: time.Now().UTC()}
 	return nil
 }
 func (r *Runner) snapshot() Dashboard {
@@ -211,9 +216,6 @@ func (r *Runner) run(ctx context.Context) error {
 		}
 	}()
 	end := r.catalogue.Total
-	if r.profile == "showcase" {
-		end = int64(len(r.catalogue.Prelude))
-	}
 	if r.limit > 0 {
 		end = min(end, r.cp.Next+r.limit)
 	}
@@ -222,12 +224,15 @@ func (r *Runner) run(ctx context.Context) error {
 		return err
 	}
 	defer report.Close()
+	var activeKey string
+	var created snat.WireReply
 	for index := r.cp.Next; index < end; index++ {
 		c := r.catalogue.At(index)
-		p := snat.Progress{RunID: r.cp.RunID, Name: c.Name(), Description: c.Description(), Index: index + 1, Total: end, Completed: index, Succeeded: r.cp.Succeeded, Unsupported: r.cp.Unsupported, Failed: r.cp.Failed, Status: "preparing"}
+		p := snat.Progress{RunID: r.cp.RunID, Name: c.ExampleName(), Description: c.Description(), Index: index + 1, Total: end, Completed: index, Succeeded: r.cp.Succeeded, Unsupported: r.cp.Unsupported, Failed: r.cp.Failed, Status: "preparing"}
 		r.mu.Lock()
 		r.state.Progress = p
 		r.state.Configuration = &c
+		r.state.Group = groupTitles[c.Group]
 		r.state.DType = c.DType.String()
 		r.state.Mode = c.Mode.String()
 		r.mu.Unlock()
@@ -244,9 +249,27 @@ func (r *Runner) run(ctx context.Context) error {
 			layers = declaration(c)
 		}
 		session := &snat.Session{Title: c.Name(), Model: "Welvet " + c.Layer, Source: "welvet-sweep", Description: c.Description(), Layers: layers, Metadata: map[string]any{"configuration": c, "configuration_id": c.ID(), "welvet": "1.1.3", "trace_contract": "TCP management; native tanhi1 UDP timing plus session-tagged TANHI UDP measured activation and parameter-delta events; real shape adapters"}}
-		created, err := r.send(ctx, snat.WireMessage{Op: "create", Key: r.cp.RunID + "/" + c.ID(), Session: session, Progress: &p})
-		if err != nil {
-			return err
+		key := r.cp.RunID + "/" + c.ID()
+		grouped := c.Group != ""
+		if grouped {
+			key = r.cp.RunID + "/group/" + c.Group
+			session.Title = groupTitles[c.Group]
+			session.Description = "Named examples of " + groupTitles[c.Group] + ". Select a chapter to replay its network."
+		}
+		if key != activeKey {
+			created, err = r.send(ctx, snat.WireMessage{Op: "create", Key: key, Session: session, Progress: &p})
+			if err != nil {
+				return err
+			}
+			activeKey = key
+		}
+		alreadyDone := false
+		if grouped {
+			created, err = r.send(ctx, snat.WireMessage{Op: "begin_chapter", ID: created.ID, Chapter: &snat.Chapter{ID: c.ID(), Name: c.ExampleName(), Description: c.Description(), Layers: layers, Metadata: map[string]any{"configuration": c}}, Progress: &p})
+			if err != nil {
+				return err
+			}
+			alreadyDone = created.Chapter != nil && created.Chapter.Status != "running"
 		}
 		sender, err := r.client.TANHI(created.ID, created.StreamToken)
 		if err != nil {
@@ -259,7 +282,7 @@ func (r *Runner) run(ctx context.Context) error {
 		}
 		udpPort, _ := strconv.Atoi(port)
 		nativeConfig := &tanhi.UDPConfig{Enabled: true, Host: host, Port: udpPort, SendShape: true}
-		if buildErr == nil {
+		if buildErr == nil && !alreadyDone {
 			m.grid.Tanhi = nativeConfig
 			parallel.SyncGridTanhi(m.grid)
 			tanhi.EmitSweep(nativeConfig, sender.StartMarker())
@@ -312,10 +335,10 @@ func (r *Runner) run(ctx context.Context) error {
 			}
 		}
 		runErr := buildErr
-		if runErr == nil {
+		if runErr == nil && !alreadyDone {
 			runErr = emit(initialWeightEvents(m, c))
 		}
-		if runErr == nil {
+		if runErr == nil && !alreadyDone {
 			runErr = safeExample(ctx, c, m, r.samples, r.lr, emit, progress)
 		}
 		if ctx.Err() != nil {
@@ -327,10 +350,13 @@ func (r *Runner) run(ctx context.Context) error {
 		if err = flush(); err != nil {
 			return err
 		}
-		if buildErr == nil {
+		if buildErr == nil && !alreadyDone {
 			tanhi.EmitSweep(nativeConfig, sender.EndMarker())
 		}
-		receipt, err := sender.Flush(ctx, buildErr == nil)
+		receipt := created
+		if !alreadyDone {
+			receipt, err = sender.Flush(ctx, buildErr == nil)
+		}
 		if err != nil {
 			sender.Close()
 			return err
@@ -341,6 +367,9 @@ func (r *Runner) run(ctx context.Context) error {
 		r.state.Telemetry = receipt.Telemetry
 		r.mu.Unlock()
 		status := classifyFailure(runErr)
+		if alreadyDone {
+			status = created.Chapter.Status
+		}
 		p.Status = status
 		p.Percent = 100
 		if runErr != nil {
@@ -358,8 +387,23 @@ func (r *Runner) run(ctx context.Context) error {
 		p.Unsupported = r.cp.Unsupported
 		p.Failed = r.cp.Failed
 		p.Completed = index + 1
-		if _, err = r.send(ctx, snat.WireMessage{Op: "finish", ID: created.ID, ExpectedPackets: receipt.Telemetry.Samples + receipt.Telemetry.SampleMissing, Status: status, Progress: &p}); err != nil {
-			return err
+		if grouped && !alreadyDone {
+			_, err = r.send(ctx, snat.WireMessage{Op: "end_chapter", ID: created.ID, ExpectedPackets: receipt.Telemetry.Samples + receipt.Telemetry.SampleMissing, Chapter: &snat.Chapter{ID: c.ID(), Metadata: map[string]any{"configuration": c, "error": p.Error}}, Status: status, Progress: &p})
+			if err != nil {
+				return err
+			}
+		}
+		lastInGroup := !grouped || index+1 >= r.catalogue.Total || r.catalogue.At(index+1).Group != c.Group
+		if lastInGroup {
+			_, err = r.send(ctx, snat.WireMessage{Op: "finish", ID: created.ID, ExpectedPackets: receipt.Telemetry.Samples + receipt.Telemetry.SampleMissing, Status: func() string {
+				if grouped {
+					return "complete"
+				}
+				return status
+			}(), Progress: &p})
+			if err != nil {
+				return err
+			}
 		}
 		r.mu.Lock()
 		r.state.Progress = p
@@ -378,7 +422,7 @@ func (r *Runner) run(ctx context.Context) error {
 				return e
 			}
 		}
-		result := Result{Telemetry: receipt.Telemetry, Index: index + 1, Name: c.Name(), ID: c.ID(), SessionID: created.ID, Status: status, Duration: time.Since(started).Seconds()}
+		result := Result{Telemetry: receipt.Telemetry, Index: index + 1, Name: c.ExampleName(), ID: c.ID(), SessionID: created.ID, Status: status, Duration: time.Since(started).Seconds()}
 		if runErr != nil {
 			result.Error = runErr.Error()
 		}

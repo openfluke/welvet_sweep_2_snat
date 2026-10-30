@@ -252,3 +252,140 @@ func TestDashboardAndPause(t *testing.T) {
 		t.Fatal("accepted cross-origin control")
 	}
 }
+
+func TestCompactShowcasePlan(t *testing.T) {
+	c := NewCatalogue(3)
+	c.UseShowcase()
+	if c.Total != 123 || c.SessionCount() != 5 {
+		t.Fatalf("plan: %d examples / %d sessions", c.Total, c.SessionCount())
+	}
+	counts := map[string]int{}
+	ids := map[string]bool{}
+	dtypes, layers, modes := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for i := int64(0); i < c.Total; i++ {
+		v := c.At(i)
+		counts[v.Group]++
+		if ids[v.ID()] {
+			t.Fatal("duplicate chapter id")
+		}
+		ids[v.ID()] = true
+		if v.Group == "dtypes" {
+			dtypes[v.DType.String()] = true
+		}
+		if v.Group == "layers" {
+			layers[v.Layer] = true
+		}
+		if v.Group == "training" {
+			modes[v.Mode.String()] = true
+		}
+	}
+	if counts["dtypes"] != 34 || counts["layers"] != 23 || counts["training"] != 34 || counts["parallel"] != 12 || counts["cameral"] != 20 || len(dtypes) != 34 || len(layers) != 23 || len(modes) != 34 {
+		t.Fatal(counts)
+	}
+}
+func TestGroupedShowcaseSavesFiveSessions(t *testing.T) {
+	root := t.TempDir()
+	raw, _ := json.Marshal(snat.Request{Action: "server_start", Address: "127.0.0.1:0"})
+	value, err := snat.Execute(root, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snat.StopLive(root)
+	c := NewCatalogue(1)
+	c.UseShowcase()
+	// Two cheap examples in each group exercise every transition without running
+	// the entire catalogue or the entire showcase during this integration check.
+	picks := []Configuration{}
+	seen := map[string]int{}
+	for _, cfg := range c.Showcase {
+		if seen[cfg.Group] < 2 {
+			v := cfg
+			v.Layer = "dense"
+			v.DType = core.DTypeFloat32
+			v.Mode = parallel.ModeNormalBP
+			picks = append(picks, v)
+			seen[cfg.Group]++
+		}
+	}
+	c.Showcase = picks
+	c.Total = int64(len(picks))
+	r := &Runner{catalogue: c, tcp: value.(snat.LiveStatus).Address, data: t.TempDir(), samples: 1, lr: .001, profile: "showcase", limit: 1}
+	if err = r.initialize(false); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err = r.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.cp.Next != 1 {
+		t.Fatal("bounded first launch did not stop")
+	}
+	resumed := &Runner{catalogue: c, tcp: r.tcp, data: r.data, samples: 1, lr: .001, profile: "showcase"}
+	if err = resumed.initialize(false); err != nil {
+		t.Fatal(err)
+	}
+	if err = resumed.run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.cp.Succeeded != 10 {
+		t.Fatalf("resume counts: %+v", resumed.cp)
+	}
+	raw, _ = json.Marshal(snat.Request{Action: "library"})
+	value, err = snat.Execute(root, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(value)
+	var library struct {
+		Sessions []snat.Summary `json:"sessions"`
+	}
+	json.Unmarshal(encoded, &library)
+	if len(library.Sessions) != 5 {
+		t.Fatalf("got %d sessions", len(library.Sessions))
+	}
+	for _, entry := range library.Sessions {
+		raw, _ = json.Marshal(snat.Request{Action: "open", ID: entry.ID})
+		v, e := snat.Execute(root, raw)
+		if e != nil {
+			t.Fatal(e)
+		}
+		saved := v.(*snat.Session)
+		if saved.Status != "complete" || len(saved.Chapters) != 2 {
+			t.Fatalf("bad grouped recording: %+v", saved)
+		}
+		for _, ch := range saved.Chapters {
+			if ch.EndEvent <= ch.StartEvent || ch.Status != "complete" {
+				t.Fatalf("empty/incomplete chapter: %+v", ch)
+			}
+		}
+	}
+}
+func TestDashboardStartValidatesAddressAndWaits(t *testing.T) {
+	r := &Runner{state: Dashboard{Profile: "showcase", CatalogueTotal: 123, SessionCount: 5}}
+	called := 0
+	handler := dashboardHandler(r, func(address, token string) error {
+		called++
+		if address != "127.0.0.1:9731" || token != "test" {
+			t.Fatal(address, token)
+		}
+		return nil
+	})
+	for _, test := range []struct {
+		body string
+		code int
+	}{
+		{`{"host":"not an IP","port":9731}`, 400},
+		{`{"host":"127.0.0.1","port":0}`, 400},
+		{`{"host":"127.0.0.1","port":9731,"token":"test"}`, 202},
+	} {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest("POST", "/api/start", strings.NewReader(test.body)))
+		if w.Code != test.code {
+			t.Fatalf("%d: %s", w.Code, w.Body.String())
+		}
+	}
+	if called != 1 {
+		t.Fatal("invalid requests started a run")
+	}
+}
