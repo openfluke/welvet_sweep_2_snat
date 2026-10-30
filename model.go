@@ -366,10 +366,34 @@ func tensorInput() *core.Tensor[float32] {
 	}
 	return x
 }
+func withoutSamples(l snat.Layer) snat.Layer {
+	l.Samples = nil
+	l.Branches = append([]snat.Layer(nil), l.Branches...)
+	for i := range l.Branches {
+		l.Branches[i] = withoutSamples(l.Branches[i])
+	}
+	return l
+}
 func (m *model) layers() []snat.Layer {
 	layers := []snat.Layer{}
 	for _, n := range m.nodes {
-		layers = append(layers, n.layer)
+		layers = append(layers, withoutSamples(n.layer))
 	}
 	return layers
+}
+func initialWeightEvents(m *model, c Configuration) []snat.Event {
+	events := []snat.Event{}
+	var walk func(*node)
+	walk = func(n *node) {
+		if len(n.layer.Samples) > 0 {
+			events = append(events, eventFor(n, n.layer.Samples, "forward", "initial_weights", "sampled_weights", -1, c))
+		}
+		for _, child := range n.children {
+			walk(child)
+		}
+	}
+	for _, n := range m.nodes {
+		walk(n)
+	}
+	return events
 }

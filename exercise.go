@@ -23,7 +23,7 @@ func eventFor(n *node, values []float32, direction, phase, kind string, tick int
 	if c.Mode.IsLineStep() || c.Mode.RequiresGrid() {
 		mode = "step"
 	}
-	return snat.Event{"Type": direction, "mode": mode, "step_count": tick, "layer_id": n.layer.ID, "grid_depth": n.layer.GridDepth, "grid_row": n.layer.GridRow, "grid_col": n.layer.GridCol, "cell_layer": n.layer.CellLayer, "values": sample(values, 32), "values_kind": kind, "phase": phase, "train_mode": c.Mode.String(), "dtype": c.DType.String(), "Stats": map[string]any{"LayerType": n.layer.Type}}
+	return snat.Event{"Type": direction, "mode": mode, "step_count": tick, "layer_id": n.layer.ID, "grid_depth": n.layer.GridDepth, "grid_row": n.layer.GridRow, "grid_col": n.layer.GridCol, "cell_layer": n.layer.CellLayer, "values": sample(values, 32), "values_kind": kind, "phase": phase, "train_mode": c.Mode.String(), "dtype": c.DType.String(), "dtype_id": int(c.DType), "Stats": map[string]any{"LayerType": n.layer.Type}}
 }
 func runOp(n *node, input *core.Tensor[float32]) (*core.Tensor[float32], error) {
 	switch op := n.op.(type) {
@@ -69,7 +69,7 @@ func probeNode(ctx context.Context, n *node, input *core.Tensor[float32], tick i
 		return nil, err
 	}
 	n.lastOut = out
-	if err = emit([]snat.Event{eventFor(n, out.Data, "forward", "diagnostic_forward", "activation", tick, c)}); err != nil {
+	if err = emit([]snat.Event{activationEvent(n, out, tick, c)}); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -289,4 +289,10 @@ func classifyFailure(err error) string {
 		return "cancelled"
 	}
 	return "failed"
+}
+
+func activationEvent(n *node, out *core.Tensor[float32], tick int, c Configuration) snat.Event {
+	e := eventFor(n, out.Data, "forward", "diagnostic_forward", "activation", tick, c)
+	e["shape"] = out.Shape
+	return e
 }

@@ -10,8 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"github.com/openfluke/snat"
+	"github.com/openfluke/welvet/layers/parallel"
+	"github.com/openfluke/welvet/systems/tanhi"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,15 +23,17 @@ import (
 )
 
 type Result struct {
-	Index     int64   `json:"index"`
-	Name      string  `json:"name"`
-	ID        string  `json:"id"`
-	SessionID string  `json:"session_id"`
-	Status    string  `json:"status"`
-	Error     string  `json:"error,omitempty"`
-	Duration  float64 `json:"duration_seconds"`
+	Telemetry snat.UDPStats `json:"telemetry"`
+	Index     int64         `json:"index"`
+	Name      string        `json:"name"`
+	ID        string        `json:"id"`
+	SessionID string        `json:"session_id"`
+	Status    string        `json:"status"`
+	Error     string        `json:"error,omitempty"`
+	Duration  float64       `json:"duration_seconds"`
 }
 type Dashboard struct {
+	Telemetry      snat.UDPStats  `json:"telemetry"`
 	Progress       snat.Progress  `json:"progress"`
 	Configuration  *Configuration `json:"configuration"`
 	DType          string         `json:"dtype"`
@@ -237,22 +243,48 @@ func (r *Runner) run(ctx context.Context) error {
 		if len(layers) == 0 {
 			layers = declaration(c)
 		}
-		session := &snat.Session{Title: c.Name(), Model: "Welvet " + c.Layer, Source: "welvet-sweep", Description: c.Description(), Layers: layers, Metadata: map[string]any{"configuration": c, "configuration_id": c.ID(), "welvet": "1.1.3", "trace_contract": "diagnostic_forward activations plus sampled parameter-update deltas; shape adapters are real Welvet Ops"}}
+		session := &snat.Session{Title: c.Name(), Model: "Welvet " + c.Layer, Source: "welvet-sweep", Description: c.Description(), Layers: layers, Metadata: map[string]any{"configuration": c, "configuration_id": c.ID(), "welvet": "1.1.3", "trace_contract": "TCP management; native tanhi1 UDP timing plus session-tagged TANHI UDP measured activation and parameter-delta events; real shape adapters"}}
 		created, err := r.send(ctx, snat.WireMessage{Op: "create", Key: r.cp.RunID + "/" + c.ID(), Session: session, Progress: &p})
 		if err != nil {
 			return err
 		}
-		sequence := int64(0)
+		sender, err := r.client.TANHI(created.ID, created.StreamToken)
+		if err != nil {
+			return err
+		}
+		host, port, e := net.SplitHostPort(sender.Address())
+		if e != nil {
+			sender.Close()
+			return e
+		}
+		udpPort, _ := strconv.Atoi(port)
+		nativeConfig := &tanhi.UDPConfig{Enabled: true, Host: host, Port: udpPort, SendShape: true}
+		if buildErr == nil {
+			m.grid.Tanhi = nativeConfig
+			parallel.SyncGridTanhi(m.grid)
+			tanhi.EmitSweep(nativeConfig, sender.StartMarker())
+		}
 		eventCount := 0
 		pending := []snat.Event{}
 		flush := func() error {
 			if len(pending) == 0 {
 				return nil
 			}
-			if _, e := r.send(ctx, snat.WireMessage{Op: "append", ID: created.ID, Sequence: sequence, Events: pending, Progress: &p}); e != nil {
+			for _, event := range pending {
+				if e := sender.SendEvent(event); e != nil {
+					return e
+				}
+			}
+			receipt, e := sender.Flush(ctx, false)
+			if e != nil {
 				return e
 			}
-			sequence++
+			if _, e = r.send(ctx, snat.WireMessage{Op: "progress", Progress: &p}); e != nil {
+				return e
+			}
+			r.mu.Lock()
+			r.state.Telemetry = receipt.Telemetry
+			r.mu.Unlock()
 			eventCount += len(pending)
 			pending = nil
 			return r.wait(ctx, r.delay)
@@ -281,6 +313,9 @@ func (r *Runner) run(ctx context.Context) error {
 		}
 		runErr := buildErr
 		if runErr == nil {
+			runErr = emit(initialWeightEvents(m, c))
+		}
+		if runErr == nil {
 			runErr = safeExample(ctx, c, m, r.samples, r.lr, emit, progress)
 		}
 		if ctx.Err() != nil {
@@ -292,6 +327,19 @@ func (r *Runner) run(ctx context.Context) error {
 		if err = flush(); err != nil {
 			return err
 		}
+		if buildErr == nil {
+			tanhi.EmitSweep(nativeConfig, sender.EndMarker())
+		}
+		receipt, err := sender.Flush(ctx, buildErr == nil)
+		if err != nil {
+			sender.Close()
+			return err
+		}
+		sender.Close()
+		eventCount = receipt.EventCount
+		r.mu.Lock()
+		r.state.Telemetry = receipt.Telemetry
+		r.mu.Unlock()
 		status := classifyFailure(runErr)
 		p.Status = status
 		p.Percent = 100
@@ -310,7 +358,7 @@ func (r *Runner) run(ctx context.Context) error {
 		p.Unsupported = r.cp.Unsupported
 		p.Failed = r.cp.Failed
 		p.Completed = index + 1
-		if _, err = r.send(ctx, snat.WireMessage{Op: "finish", ID: created.ID, Sequence: sequence, Status: status, Progress: &p}); err != nil {
+		if _, err = r.send(ctx, snat.WireMessage{Op: "finish", ID: created.ID, ExpectedPackets: receipt.Telemetry.Samples + receipt.Telemetry.SampleMissing, Status: status, Progress: &p}); err != nil {
 			return err
 		}
 		r.mu.Lock()
@@ -330,7 +378,7 @@ func (r *Runner) run(ctx context.Context) error {
 				return e
 			}
 		}
-		result := Result{Index: index + 1, Name: c.Name(), ID: c.ID(), SessionID: created.ID, Status: status, Duration: time.Since(started).Seconds()}
+		result := Result{Telemetry: receipt.Telemetry, Index: index + 1, Name: c.Name(), ID: c.ID(), SessionID: created.ID, Status: status, Duration: time.Since(started).Seconds()}
 		if runErr != nil {
 			result.Error = runErr.Error()
 		}
